@@ -1,4 +1,4 @@
-# First deployment: hub plus background Prometheus, without the unpaired agent.
+# First deployment: hub plus background Prometheus, without the agent and bot.
 # Copy the hub public key, then switch this SAME resource to docker-compose.yml.
 # Keep shared service/volume definitions in sync with docker-compose.yml.
 x-logging: &logging

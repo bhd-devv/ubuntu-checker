@@ -2,6 +2,7 @@
 
 Beszel — основний вебінтерфейс для CPU, RAM, дисків, мережі та Docker-контейнерів.
 Prometheus паралельно збирає метрики Node Exporter і cAdvisor у фоні, незалежно від Beszel.
+Окремий контейнер `telegram-bot` читає свіжі метрики Beszel та надсилає критичні сповіщення.
 Обидві системи зберігають історію за останні **30 днів** у постійних Docker volumes.
 
 ```text
@@ -10,6 +11,8 @@ Prometheus паралельно збирає метрики Node Exporter і cAd
 
 Prometheus:9090 (внутрішній) ─┬─ docker0 IP:9100 → Node Exporter → хост
                             └─ cadvisor:8080  → cAdvisor → Docker-контейнери
+
+Telegram ← telegram-bot → внутрішній API Beszel Hub
 ```
 
 Beszel має власну базу й не використовує Prometheus як datasource. Їхні значення можуть трохи відрізнятися через різні формули та інтервали збору.
@@ -92,7 +95,8 @@ Prometheus та експортери працюють уже на першому
 10. Перевір збережені `NODE_EXPORTER_HOST`, `DOCKER_DATA_ROOT` та, за потреби, `DOCKER_ENDPOINT` (див. `.env.example`).
 11. У **тій самій** Coolify application зміни **Docker Compose Location** на `/docker-compose.yml`, збережи та перезавантаж конфігурацію з Git.
     Переконайся, що домен лишився привʼязаним до сервісу **beszel:8090**.
-12. Натисни **Deploy**. Залиш звичайний режим Compose, **Raw mode не вмикай**. Не додавай домени для агента, Prometheus чи експортерів.
+12. Перед фінальним деплоєм встанови `TELEGRAM_BOT_TOKEN` та `TELEGRAM_CHAT_ID` за інструкцією нижче. У `compose.setup.yml` бот ще не запускається.
+13. Натисни **Deploy**. Залиш звичайний режим Compose, **Raw mode не вмикай**. Не додавай домени для агента, бота, Prometheus чи експортерів.
 
 Назви сервісу `beszel` та volumes збігаються в обох Compose-файлах, тому дані Hub зберігаються при перемиканні в межах тієї самої Coolify application.
 Не створюй другу application між кроками: вона отримає інші volumes і новий ключ.
@@ -115,8 +119,68 @@ Retention Prometheus заданий безпосередньо як `30d`, що�
 
 ## Сповіщення та фонові правила
 
-У Beszel можна налаштувати пороги CPU/RAM/диска та канали сповіщень через вебінтерфейс.
-Email/Telegram самостійно не надсилаються, доки відповідний канал не налаштовано.
+### Telegram-бот
+
+Бот запускається у власному контейнері без відкритих портів. Він опитує Beszel API кожні 30 секунд і перевіряє останній запис типу `1m`, а не усереднені місячні дані.
+
+| Метрика | Критичний поріг | Повідомлення про відновлення |
+| --- | --- | --- |
+| Загальне CPU сервера | **>95%** | ≤92% |
+| GPU, кожна окремо | **>95%** | ≤92% |
+| RAM сервера | **>70%** | ≤67% |
+| VRAM, кожна GPU окремо | **>70%** від `memory used / memory total` | ≤67% |
+| Основна батарея ноутбука | **<35%** | ≥38% |
+
+Перше перевищення спричиняє повідомлення одразу після отримання свіжого запису. У Beszel запис оновлюється приблизно раз на хвилину, тому це не миттєва перевірка коротких піків.
+Сповіщення про батарею працює і під час заряджання, якщо заряд нижчий за 35%. Батареї мишок та інших периферійних пристроїв не використовуються.
+Поки поріг перевищений, бот повторює сповіщення раз на 30 хвилин (`TELEGRAM_ALERT_REPEAT_SECONDS=1800`). Різні GPU та різні метрики мають окремий стан.
+Запас 3 відсоткові пункти для відновлення запобігає потоку повідомлень поблизу порога. Якщо значення вже нижче критичного, але ще в цьому запасі, повтори не надсилаються.
+Стан зберігається в `telegram-bot-data`, тому звичайний restart/redeploy не повторює вже надіслану тривогу.
+Невдала доставка повторюється; Telegram rate limits враховуються. Рідкісний збій між доставкою та записом стану може призвести до дублювання.
+
+Налаштування:
+
+1. Створи бота через [@BotFather](https://t.me/BotFather) і додай token у **Coolify → Environment Variables → `TELEGRAM_BOT_TOKEN`**.
+2. Відкрий приватний чат із ботом і натисни **Start**, або додай його в потрібну групу з дозволом писати повідомлення.
+3. Дізнайся ID потрібного чату через Telegram Bot API `getUpdates` після повідомлення боту. Для груп повідомлення має бути видиме боту, наприклад команда з його username. Збережи значення `message.chat.id` у `TELEGRAM_CHAT_ID` (для груп воно зазвичай відʼємне).
+4. За замовчуванням бот використовує `BESZEL_USER_EMAIL/PASSWORD`. За потреби створи окремого користувача Beszel з read-only доступом до потрібної системи та задай `TELEGRAM_BESZEL_EMAIL/PASSWORD`.
+   Якщо пароль користувача вже змінений у UI, тут має бути актуальний пароль, а не старе початкове значення.
+5. За замовчуванням перевіряються всі доступні цьому користувачу системи. Для одного ноутбука задай `TELEGRAM_BESZEL_SYSTEM_ID` — ID його запису в API Beszel (15 символів).
+6. Зроби redeploy повного `docker-compose.yml`. Coolify збере образ бота з `telegram-bot/Dockerfile`; зовнішні Python-пакети не потрібні.
+
+На хості потрібен вихідний HTTPS-доступ до `api.telegram.org:443`. Бот надсилає звичайні повідомлення з `disable_notification=false`; фактичний звук/push залежить також від налаштувань Telegram на телефоні.
+Token і пароль не записуються у файл стану й не виводяться в повідомленнях помилок.
+
+Якщо відсутня GPU/VRAM/батарея, система Down або записи старші трьох хвилин, бот не підставляє нулі й не надсилає хибне відновлення.
+Після двох хвилин безперервної відсутності даних він повідомляє про проблему; повтор — раз на 30 хвилин.
+Healthcheck бота підтверджує роботу циклу перевірки, а доступність джерела/Telegram контролюється окремо повідомленнями та логами.
+При вимкненому ноутбуку або відсутньому інтернеті бот на тому самому ноутбуку не зможе відправити сповіщення.
+
+### Доступ до GPU та батареї ноутбука
+
+Агенту додано read-only mount `/sys:/sys`. Батарея читається Linux із `/sys/class/power_supply`; її заряд має також зʼявитися в Beszel.
+Перевір на хості: `ls /sys/class/power_supply` та `cat /sys/class/power_supply/BAT*/capacity`.
+
+**AMD:** автоматичне визначення sysfs увімкнене; за потреби задай `BESZEL_GPU_COLLECTOR=amd_sysfs`. Дані залежать від драйвера ядра.
+
+**NVIDIA:** встанови NVIDIA driver та NVIDIA Container Toolkit на хості, налаштуй Docker runtime `nvidia`, перевір `nvidia-smi`. Потім у Coolify встанови:
+
+```dotenv
+BESZEL_AGENT_IMAGE=henrygd/beszel-agent-nvidia:0.21.0
+BESZEL_AGENT_RUNTIME=nvidia
+BESZEL_GPU_COLLECTOR=nvidia-smi
+```
+
+Compose уже задає `NVIDIA_VISIBLE_DEVICES=all` та `NVIDIA_DRIVER_CAPABILITIES=utility`; після redeploy агент отримає засоби збору NVIDIA.
+Для стандартного агента залишай `BESZEL_AGENT_RUNTIME=runc`.
+
+Для Intel/iGPU доступність utilization і окремої VRAM залежить від GPU/драйвера; спільна RAM не видається за dedicated VRAM.
+Для повного збору Intel може знадобитися `henrygd/beszel-agent-intel:0.21.0`, device `/dev/dri` та додаткові дозволи — див. [GPU monitoring Beszel](https://beszel.dev/guide/gpu).
+Поки Beszel не показує реальну utilization і VRAM, бот повідомлятиме про відсутність цих метрик. На цільовому обладнанні це потрібно перевірити після деплою.
+
+### Інші правила
+
+У Beszel можна додатково налаштувати пороги CPU/RAM/диска й інші канали через UI. Щоб уникнути дублів, не створюй там ті самі Telegram-алерти паралельно з контейнером бота.
 
 У Prometheus залишені 8 правил: недоступний exporter, тривалий високий CPU/load, нестача RAM, місця/inode, OOM kill та наближення контейнера до ліміту RAM.
 Вони виконуються у фоні; у Beszel автоматично не відображаються. Для перегляду — внутрішній Prometheus UI `/alerts` або API `/api/v1/alerts`.
@@ -157,12 +221,13 @@ ssh -N -L 9090:PROMETHEUS_CONTAINER_IP:9090 user@server
 | `beszel-data` | База Beszel, користувачі, історія, приватний ключ Hub |
 | `beszel-agent-data` | Постійні дані агента / fingerprint |
 | `beszel-socket` | Спільний Unix socket Hub → Agent |
+| `telegram-bot-data` | Стан тривог та часу повторів Telegram-бота |
 | `prometheus-data` | Повна історія метрик Prometheus за 30 днів |
 
 Звичайний redeploy зберігає volumes. Не використовуй `docker compose down -v` і не видаляй volumes у Coolify, якщо потрібна історія.
 Роби резервні копії бази Beszel та даних Prometheus; retention не замінює backup.
 
-Ліміти RAM: Hub 256 MiB, Agent 128 MiB, Prometheus 1 GiB, cAdvisor 512 MiB, Node Exporter 128 MiB.
+Ліміти RAM: Hub 256 MiB, Agent 128 MiB, Telegram-бот 128 MiB, Prometheus 1 GiB, cAdvisor 512 MiB, Node Exporter 128 MiB.
 Це верхні межі, не резервування. Реальне споживання залежить від кількості контейнерів та метрик.
 Логи кожного сервісу обмежені трьома файлами по 10 MB. Версії образів зафіксовані.
 
@@ -176,7 +241,7 @@ ssh -N -L 9090:PROMETHEUS_CONTAINER_IP:9090 user@server
 sh scripts/check.sh
 ```
 
-Скрипт перевіряє всі чотири варіанти Compose (setup/full, Coolify/local), конфігурацію Prometheus, його 8 правил та сценарії алертів.
+Скрипт перевіряє всі чотири варіанти Compose (setup/full, Coolify/local), логіку Telegram-бота, конфігурацію Prometheus, його 8 правил та сценарії алертів. Тести не надсилають повідомлень у реальний Telegram.
 Потрібні Docker Compose й запущений Docker daemon; якщо встановлено локальний `promtool`, daemon для цих перевірок не потрібен.
 Тестові env-значення використовуються лише для валідації, сервіси не запускаються.
 
@@ -194,7 +259,7 @@ Beszel доступний лише на `127.0.0.1:8090`. Для віддале�
 ssh -N -L 8090:127.0.0.1:8090 user@server
 ```
 
-Відкрий `http://localhost:8090`, додай систему з Host `/beszel_socket/beszel.sock` та скопіюй публічний ключ у `BESZEL_AGENT_KEY` у `.env`.
+Відкрий `http://localhost:8090`, додай систему з Host `/beszel_socket/beszel.sock` та скопіюй публічний ключ у `BESZEL_AGENT_KEY` у `.env`. Заповни також `TELEGRAM_BOT_TOKEN` і `TELEGRAM_CHAT_ID`.
 Потім у тій самій папці, зі збереженням Compose project name:
 
 ```bash
@@ -212,5 +277,7 @@ docker compose -f docker-compose.yml -f compose.local.yml up -d
 - **Немає метрик контейнерів:** перевір Docker socket, rootful Docker, DockerRootDir і логи агента/cAdvisor.
 - **No available server:** перевір healthy у Hub та привʼязку домену до **beszel:8090**.
 - **Недостатньо місця:** перевір обсяг TSDB і бази Beszel; збільшуй диск, якщо потрібно зберігати повні 30 днів.
+- **Telegram не надходить:** перевір token/chat ID, Start у чаті, права бота в групі та вихідний HTTPS. У Runtime Logs помилки `Telegram: HTTP 401/403/429` означають проблему з token/дозволами/лімітами.
+- **GPU/VRAM або батарея недоступні:** спочатку переконайся, що їх бачить Beszel; для NVIDIA перевір Toolkit/runtime, для батареї — `/sys/class/power_supply`.
 
 Документація: [Beszel](https://beszel.dev/guide/getting-started), [змінні середовища](https://beszel.dev/guide/environment-variables), [політика зберігання Beszel 0.21.0](https://github.com/henrygd/beszel/blob/v0.21.0/internal/records/records_deletion.go), [Coolify Docker Compose](https://coolify.io/docs/applications/builds/docker-compose).

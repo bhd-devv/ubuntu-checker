@@ -28,7 +28,8 @@ services:
     logging: *logging
 
   beszel-agent:
-    image: henrygd/beszel-agent:0.21.0
+    image: ${BESZEL_AGENT_IMAGE:-henrygd/beszel-agent:0.21.0}
+    runtime: ${BESZEL_AGENT_RUNTIME:-runc}
     restart: unless-stopped
     # Host networking gives the agent the server's interface counters.
     # The hub connects through a shared Unix socket; no agent TCP port is opened.
@@ -41,17 +42,57 @@ services:
       NICS: "-lo,veth*,docker*,br-*"
       DOCKER_HOST: ${DOCKER_ENDPOINT:-unix:///var/run/docker.sock}
       DOCKER_IMAGE_CHECK: "false"
+      GPU_COLLECTOR: ${BESZEL_GPU_COLLECTOR:-}
+      # Effective only with NVIDIA Container Toolkit and the nvidia runtime.
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: utility
     volumes:
       - beszel-agent-data:/var/lib/beszel-agent
       - beszel-socket:/beszel_socket
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - /:/host:ro,rslave
+      # Linux battery and GPU sysfs counters belong to the host.
+      - /sys:/sys:ro
     healthcheck:
       test: ["CMD", "/agent", "health"]
       interval: 30s
       timeout: 5s
       retries: 5
       start_period: 90s
+    mem_limit: 128m
+    logging: *logging
+
+  telegram-bot:
+    build:
+      context: ./telegram-bot
+    restart: unless-stopped
+    init: true
+    environment:
+      BESZEL_URL: http://beszel:8090
+      BESZEL_EMAIL: ${TELEGRAM_BESZEL_EMAIL:-${BESZEL_USER_EMAIL}}
+      BESZEL_PASSWORD: ${TELEGRAM_BESZEL_PASSWORD:-${BESZEL_USER_PASSWORD}}
+      BESZEL_SYSTEM_ID: ${TELEGRAM_BESZEL_SYSTEM_ID:-}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?Set TELEGRAM_BOT_TOKEN from BotFather}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:?Set TELEGRAM_CHAT_ID for notifications}
+      POLL_INTERVAL_SECONDS: ${TELEGRAM_POLL_INTERVAL_SECONDS:-30}
+      ALERT_REPEAT_SECONDS: ${TELEGRAM_ALERT_REPEAT_SECONDS:-1800}
+      STATE_DIR: /data
+    volumes:
+      - telegram-bot-data:/data
+    depends_on:
+      beszel:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      test: ["CMD", "python", "/app/bot.py", "--health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     mem_limit: 128m
     logging: *logging
 
@@ -144,4 +185,5 @@ volumes:
   beszel-data:
   beszel-agent-data:
   beszel-socket:
+  telegram-bot-data:
   prometheus-data:

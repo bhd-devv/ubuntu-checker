@@ -21,6 +21,7 @@ id_rsa
 /beszel_socket/
 /prometheus-data/
 /prometheus_data/
+/telegram-bot-data/
 /backups/
 *.db
 *.db-shm
