@@ -1,0 +1,73 @@
+groups:
+  - name: server
+    rules:
+      - alert: ExporterDown
+        expr: up{job=~"node|cadvisor"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Немає метрик: {{ $labels.job }}"
+          description: "Prometheus не може опитати {{ $labels.instance }} понад 2 хвилини."
+
+      - alert: HostHighCPU
+        expr: 100 * (1 - avg by (instance) (rate(node_cpu_seconds_total{job="node",mode="idle"}[5m]))) > 85
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "CPU понад 85%"
+          description: "Високе навантаження CPU на {{ $labels.instance }} понад 10 хвилин."
+
+      - alert: HostHighLoad
+        expr: node_load5{job="node"} / count by (job, instance) (node_cpu_seconds_total{job="node",mode="idle"}) > 1.5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Високий load average на ядро"
+          description: "Load за 5 хвилин / кількість логічних CPU перевищує 1.5 понад 10 хвилин."
+
+      - alert: HostLowMemory
+        expr: 100 * node_memory_MemAvailable_bytes{job="node"} / node_memory_MemTotal_bytes{job="node"} < 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Доступно менше 10% RAM"
+          description: "На {{ $labels.instance }} мало доступної памʼяті понад 5 хвилин."
+
+      - alert: HostDiskSpaceLow
+        expr: (100 * node_filesystem_avail_bytes{job="node",fstype!~"tmpfs|devtmpfs|overlay|squashfs|nsfs"} / node_filesystem_size_bytes{job="node"} < 15) and on (instance,device,mountpoint) (node_filesystem_readonly{job="node"} == 0)
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "На {{ $labels.mountpoint }} менше 15% вільного місця"
+          description: "Перевірте Docker volumes, образи, логи та дані Prometheus."
+
+      - alert: HostDiskInodesLow
+        expr: (100 * node_filesystem_files_free{job="node",fstype!~"tmpfs|devtmpfs|overlay|squashfs|nsfs"} / node_filesystem_files{job="node"} < 10) and on (instance,device,mountpoint) (node_filesystem_readonly{job="node"} == 0)
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "На {{ $labels.mountpoint }} менше 10% вільних inode"
+          description: "Диск може перестати приймати нові файли навіть за наявності вільних байтів."
+
+      - alert: HostOOMKill
+        expr: increase(node_vmstat_oom_kill{job="node"}[5m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "Ядро завершило процес через нестачу памʼяті"
+          description: "Перевірте ліміти RAM контейнерів та журнали ядра на {{ $labels.instance }}."
+
+      - alert: ContainerNearMemoryLimit
+        expr: (100 * container_memory_working_set_bytes{job="cadvisor",name!="",image!=""} / container_spec_memory_limit_bytes{job="cadvisor"} > 90) and on (instance,id) (container_spec_memory_limit_bytes{job="cadvisor"} > 0) and on (instance,id) (container_spec_memory_limit_bytes{job="cadvisor"} < 1e15)
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Контейнер {{ $labels.name }} використовує понад 90% ліміту RAM"
+          description: "Перевірте споживання памʼяті та встановлений ліміт контейнера."

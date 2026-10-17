@@ -1,0 +1,41 @@
+.env
+.env.*
+*.env
+!.env.example
+
+# Credentials and private keys.
+/secrets/
+*.key
+*.pem
+*.p12
+*.pfx
+id_ed25519
+id_rsa
+
+# Runtime data and local backups (production uses named Docker volumes).
+/beszel-data/
+/beszel_data/
+/beszel-agent-data/
+/beszel_agent_data/
+/beszel-socket/
+/beszel_socket/
+/prometheus-data/
+/prometheus_data/
+/backups/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.sqlite-shm
+*.sqlite-wal
+*.sqlite3-shm
+*.sqlite3-wal
+*.log
+
+# Local tooling and OS files.
+__pycache__/
+.venv/
+.cache/
+.DS_Store
+._*

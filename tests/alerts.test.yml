@@ -1,0 +1,83 @@
+rule_files:
+  - ../prometheus/alerts.yml
+
+evaluation_interval: 30s
+tests:
+  - name: Healthy host has no warnings
+    interval: 1m
+    input_series:
+      - series: 'up{job="node",instance="node-host:9100"}'
+        values: '1+0x30'
+      - series: 'up{job="cadvisor",instance="cadvisor:8080"}'
+        values: '1+0x30'
+      - series: 'node_cpu_seconds_total{job="node",instance="node-host:9100",cpu="0",mode="idle"}'
+        values: '0+54x30'
+      - series: 'node_memory_MemAvailable_bytes{job="node",instance="node-host:9100"}'
+        values: '500+0x30'
+      - series: 'node_memory_MemTotal_bytes{job="node",instance="node-host:9100"}'
+        values: '1000+0x30'
+    promql_expr_test:
+      - expr: 'ALERTS{alertstate="firing"}'
+        eval_time: 20m
+        exp_samples: []
+
+  - name: Sustained CPU and memory pressure fire after the hold period
+    interval: 1m
+    input_series:
+      - series: 'node_cpu_seconds_total{job="node",instance="node-host:9100",cpu="0",mode="idle"}'
+        values: '0+3x30'
+      - series: 'node_memory_MemAvailable_bytes{job="node",instance="node-host:9100"}'
+        values: '50+0x30'
+      - series: 'node_memory_MemTotal_bytes{job="node",instance="node-host:9100"}'
+        values: '1000+0x30'
+    promql_expr_test:
+      - expr: 'ALERTS{alertstate="firing"}'
+        eval_time: 2m
+        exp_samples: []
+      - expr: 'count(ALERTS{alertname="HostHighCPU",alertstate="firing"})'
+        eval_time: 15m
+        exp_samples:
+          - labels: '{}'
+            value: 1
+      - expr: 'count(ALERTS{alertname="HostLowMemory",alertstate="firing"})'
+        eval_time: 15m
+        exp_samples:
+          - labels: '{}'
+            value: 1
+
+  - name: Low disk only alerts for writable filesystems
+    interval: 1m
+    input_series:
+      - series: 'node_filesystem_avail_bytes{job="node",instance="node-host:9100",device="/dev/sda1",mountpoint="/",fstype="ext4"}'
+        values: '5+0x30'
+      - series: 'node_filesystem_size_bytes{job="node",instance="node-host:9100",device="/dev/sda1",mountpoint="/",fstype="ext4"}'
+        values: '100+0x30'
+      - series: 'node_filesystem_readonly{job="node",instance="node-host:9100",device="/dev/sda1",mountpoint="/",fstype="ext4"}'
+        values: '0+0x30'
+      - series: 'node_filesystem_avail_bytes{job="node",instance="node-host:9100",device="/dev/sdb1",mountpoint="/archive",fstype="ext4"}'
+        values: '5+0x30'
+      - series: 'node_filesystem_size_bytes{job="node",instance="node-host:9100",device="/dev/sdb1",mountpoint="/archive",fstype="ext4"}'
+        values: '100+0x30'
+      - series: 'node_filesystem_readonly{job="node",instance="node-host:9100",device="/dev/sdb1",mountpoint="/archive",fstype="ext4"}'
+        values: '1+0x30'
+    promql_expr_test:
+      - expr: 'count(ALERTS{alertname="HostDiskSpaceLow",alertstate="firing",mountpoint="/"})'
+        eval_time: 15m
+        exp_samples:
+          - labels: '{}'
+            value: 1
+      - expr: 'ALERTS{alertname="HostDiskSpaceLow",alertstate="firing",mountpoint="/archive"}'
+        eval_time: 15m
+        exp_samples: []
+
+  - name: Exporter outage is detected
+    interval: 1m
+    input_series:
+      - series: 'up{job="cadvisor",instance="cadvisor:8080"}'
+        values: '0+0x10'
+    promql_expr_test:
+      - expr: 'count(ALERTS{alertname="ExporterDown",alertstate="firing"})'
+        eval_time: 3m
+        exp_samples:
+          - labels: '{}'
+            value: 1

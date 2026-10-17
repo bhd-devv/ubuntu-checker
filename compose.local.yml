@@ -1,0 +1,8 @@
+# Optional direct access for running on a Linux server without Coolify.
+# Use an SSH tunnel to access this loopback-only port remotely.
+services:
+  beszel:
+    environment:
+      APP_URL: http://localhost:8090
+    ports:
+      - "127.0.0.1:8090:8090"
