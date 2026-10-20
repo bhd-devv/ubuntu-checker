@@ -104,7 +104,9 @@ services:
       - /:/rootfs:ro
       - /var/run:/var/run:ro
       - /sys:/sys:ro
-      - ${DOCKER_DATA_ROOT:-/var/lib/docker}:${DOCKER_DATA_ROOT:-/var/lib/docker}:ro
+      # Keep bind paths literal: Coolify validates them before env interpolation.
+      # For a custom DockerRootDir, change BOTH paths here and in docker-compose.yml.
+      - /var/lib/docker:/var/lib/docker:ro
       - /dev/disk:/dev/disk:ro
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]

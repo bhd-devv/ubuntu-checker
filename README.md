@@ -59,7 +59,8 @@ test -d /dev/disk && echo '/dev/disk OK'
 Node Exporter використовує host networking, але слухає лише цю внутрішню адресу на 9100. Не вказуй публічну IP або `0.0.0.0`.
 Якщо firewall блокує доступ, дозволь його з підмережі цього Compose-проєкту до `docker0:9100`.
 
-Якщо DockerRootDir відрізняється від `/var/lib/docker`, встанови фактичний шлях у `DOCKER_DATA_ROOT`.
+Якщо DockerRootDir відрізняється від `/var/lib/docker`, заміни обидві частини монтування cAdvisor `/var/lib/docker:/var/lib/docker:ro` на фактичний шлях у **двох** файлах: `compose.setup.yml` та `docker-compose.yml`.
+Наприклад, для `/mnt/docker` використовуй `/mnt/docker:/mnt/docker:ro`. Шляхи мають бути явними: Coolify перевіряє volumes до підстановки env і може відхиляти `${...}`. Змінна `DOCKER_DATA_ROOT` більше не використовується.
 Beszel Agent читає кореневу файлову систему через `/host` (`FILESYSTEM=/host`) та використовує host networking для мережевих лічильників.
 Для окремих дисків за потреби додай агенту read-only bind mounts у `/extra-filesystems/<назва>`; Node Exporter уже бачить файлові системи через host root із `rslave`.
 
@@ -85,14 +86,13 @@ Prometheus та експортери працюють уже на першому
    | `BESZEL_USER_EMAIL` | Email початкового адміністратора |
    | `BESZEL_USER_PASSWORD` | Власний довгий випадковий пароль, без зовнішніх лапок |
    | `NODE_EXPORTER_HOST` | IPv4 інтерфейсу `docker0` |
-   | `DOCKER_DATA_ROOT` | Зміни лише якщо DockerRootDir відрізняється від `/var/lib/docker` |
 
 6. Спрямуй DNS на сервер Coolify proxy. У **Domains** вибери сервіс **beszel** і задай `https://monitor.example.com:8090`.
    `:8090` тут задає порт контейнера; браузер відкриває звичайний `https://monitor.example.com`.
 7. Натисни **Deploy**, відкрий Beszel і увійди з email та паролем із env.
 8. Натисни **Add System**, задай назву сервера та **Host / IP** `/beszel_socket/beszel.sock`. Порт можна залишити стандартним `45876`: для Unix socket він не використовується.
 9. Скопіюй публічний ключ із цієї форми (рядок `ssh-ed25519 ...`), збережи систему та додай у Coolify `BESZEL_AGENT_KEY` із цим ключем. Не підставляй token або приватний ключ.
-10. Перевір збережені `NODE_EXPORTER_HOST`, `DOCKER_DATA_ROOT` та, за потреби, `DOCKER_ENDPOINT` (див. `.env.example`).
+10. Перевір збережені `NODE_EXPORTER_HOST` та, за потреби, `DOCKER_ENDPOINT` (див. `.env.example`), а також явний шлях DockerRootDir у монтуваннях cAdvisor в обох Compose-файлах.
 11. У **тій самій** Coolify application зміни **Docker Compose Location** на `/docker-compose.yml`, збережи та перезавантаж конфігурацію з Git.
     Переконайся, що домен лишився привʼязаним до сервісу **beszel:8090**.
 12. Перед фінальним деплоєм встанови `TELEGRAM_BOT_TOKEN` та `TELEGRAM_CHAT_ID` за інструкцією нижче. У `compose.setup.yml` бот ще не запускається.
@@ -274,6 +274,7 @@ docker compose -f docker-compose.yml -f compose.local.yml up -d
 - **`bind: cannot assign requested address` у Node Exporter:** перевір IPv4 `docker0` та `NODE_EXPORTER_HOST`.
 - **Node target Down:** перевір адресу `node-host`, listener Node Exporter і firewall між Docker-мережею та хостом.
 - **Помилка монтування конфігурацій:** увімкни Preserve Repository; перевір, чи існують `prometheus/prometheus.yml` та `prometheus/alerts.yml` як файли.
+- **`Invalid volume source: contains forbidden character '${'`:** використовуй явні шляхи у volumes. У cAdvisor має бути `/var/lib/docker:/var/lib/docker:ro` (або фактичний DockerRootDir з обох боків) в обох Compose-файлах. Збережи виправлення в Git і перезавантаж Compose у Coolify.
 - **Немає метрик контейнерів:** перевір Docker socket, rootful Docker, DockerRootDir і логи агента/cAdvisor.
 - **No available server:** перевір healthy у Hub та привʼязку домену до **beszel:8090**.
 - **Недостатньо місця:** перевір обсяг TSDB і бази Beszel; збільшуй диск, якщо потрібно зберігати повні 30 днів.
