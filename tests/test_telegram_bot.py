@@ -4,7 +4,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from urllib.error import HTTPError
 from urllib.parse import parse_qs, urlsplit
 
@@ -131,6 +131,19 @@ class ParsingTest(unittest.TestCase):
 
 
 class APITest(unittest.TestCase):
+    def test_history_uses_millisecond_bounds_and_paginates_raw_samples(self):
+        client = bot.Beszel("http://beszel", "email", "password")
+        with patch.object(client, "get", side_effect=[
+            {"items": [{"id": "a"}], "totalPages": 2},
+            {"items": [{"id": "b"}], "totalPages": 2},
+        ]) as get:
+            self.assertEqual(list(client.history("host1", 1000, 4600)), [{"id": "a"}, {"id": "b"}])
+        self.assertEqual(get.call_args.kwargs["page"], 2)
+        self.assertEqual(get.call_args.kwargs["filter"],
+                         'system="host1" && type="1m" && created>=1000000 && created<=4600000')
+        with self.assertRaises(ValueError):
+            list(client.history('bad"id', 0, 1))
+
     def test_beszel_renews_expired_auth_and_filters_raw_samples(self):
         calls = []
         def fake(url, body=None, token=None, **_):
@@ -180,6 +193,141 @@ class APITest(unittest.TestCase):
             with self.assertRaises(bot.APIError):
                 sender.send("test")
         self.assertEqual(sender.retry_at, 1120)
+
+    def test_telegram_updates_are_nonblocking_and_restricted_to_messages(self):
+        call = Mock(return_value={"ok": True, "result": [{"update_id": 4}]})
+        sender = bot.Telegram("secret", "123", call)
+        self.assertEqual(sender.updates(3), [{"update_id": 4}])
+        self.assertEqual(call.call_args.args[1], {
+            "offset": 3, "limit": 20, "timeout": 0, "allowed_updates": ["message"]})
+
+    def test_long_reports_are_split_without_truncation(self):
+        call = Mock(return_value={"ok": True})
+        sender = bot.Telegram("secret", "123", call)
+        message = "CPU: 12%\n" * 1000
+        sender.send(message)
+        chunks = [c.args[1]["text"] for c in call.call_args_list]
+        self.assertTrue(all(len(c) <= 4000 for c in chunks))
+        self.assertEqual("".join(c.replace("\n", "") for c in chunks), message.replace("\n", ""))
+
+
+class StatusTest(unittest.TestCase):
+    now = 10000
+
+    def source(self, records, latest=None, systems=None):
+        source = Mock()
+        source.history.return_value = records
+        source.latest.return_value = latest if latest is not None else (records[-1] if records else None)
+        source.systems.return_value = systems or [{"id": "host1", "name": "VPS", "status": "up"}]
+        return source
+
+    def record(self, age, **stats):
+        return {"created": (self.now - age) * 1000, "stats": stats}
+
+    def report(self, source, status="up"):
+        return bot.status_report(source, {"id": "host1", "name": "VPS", "status": status}, self.now)
+
+    def test_current_five_minute_and_hour_means_are_distinct(self):
+        records = [self.record(i * 60 + 30, cpu=i, mp=20) for i in range(60)]
+        source = self.source(records, latest=records[0])
+        report = self.report(source)
+        self.assertIn("CPU: 0.0% | 2.0% (5) | 29.5% (60)", report)
+        self.assertIn("RAM: 20.0% | 20.0% (5) | 20.0% (60)", report)
+        self.assertIn("UTC (свіжий)", report)
+        source.history.assert_called_once_with("host1", 6400, 10000)
+
+    def test_partial_history_missing_values_and_zeroes(self):
+        records = [self.record(100, cpu=0), self.record(50, cpu=20, mp=50)]
+        report = self.report(self.source(records))
+        self.assertIn("CPU: 20.0% | 10.0% (2) | 10.0% (2)", report)
+        self.assertIn("RAM: 50.0% | 50.0% (1) | 50.0% (1)", report)
+        self.assertIn("кількість", report)
+
+    def test_window_boundaries_future_and_duplicate_records(self):
+        record = self.record(10, cpu=10)
+        records = [record, record, self.record(300, cpu=30),
+                   self.record(3600, cpu=100), self.record(-1, cpu=100)]
+        report = self.report(self.source(records, latest=record))
+        self.assertIn("CPU: 10.0% | 10.0% (1) | 20.0% (2)", report)
+
+    def test_stale_down_and_absent_samples_are_explicit(self):
+        source = self.source([self.record(600, cpu=50)])
+        self.assertIn("застарілий", self.report(source))
+        self.assertIn("CPU: 50.0% | н/д | 50.0% (1)", self.report(source))
+        self.assertIn("сервер недоступний", self.report(self.source([self.record(10, cpu=50)]), "down"))
+        empty = self.report(self.source([]))
+        self.assertIn("Останній вимір: немає даних", empty)
+        self.assertIn("CPU: н/д | н/д | н/д", empty)
+
+    def test_gpu_devices_have_separate_averages(self):
+        record = self.record(30, cpu=1, g={
+            "0": {"n": "GPU A", "u": 10, "mu": 20, "mt": 100},
+            "1": {"n": "GPU B", "u": 70, "mu": 80, "mt": 100}}, bat=[60, 1])
+        report = self.report(self.source([record]))
+        self.assertIn("GPU GPU A: 10.0% | 10.0% (1)", report)
+        self.assertIn("VRAM GPU B: 80.0% | 80.0% (1)", report)
+        self.assertIn("Батарея ноутбука: 60.0%", report)
+
+
+class CommandsTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "commands.json"
+        self.telegram = Mock(chat_id="123")
+        self.telegram.addressed_to_me.return_value = True
+        self.source = Mock()
+        self.commands = bot.Commands(self.path, self.telegram, self.source)
+
+    def update(self, update_id=5, text="/status", chat=123, date=1000):
+        return {"update_id": update_id, "message": {"text": text, "chat": {"id": chat}, "date": date}}
+
+    def test_only_configured_chat_and_fresh_status_are_processed(self):
+        self.telegram.updates.return_value = [
+            self.update(1, chat=999), self.update(2, date=0),
+            self.update(3, text="/other"), self.update(4, text="/status@mybot"),
+        ]
+        with patch.object(self.commands, "status") as status:
+            self.commands.poll(1000)
+        status.assert_called_once_with(1000)
+        self.assertEqual(self.commands.offset, 5)
+        self.assertEqual(bot.Commands(self.path, self.telegram, self.source).offset, 5)
+
+    def test_commands_for_another_bot_and_edited_messages_are_ignored(self):
+        self.telegram.addressed_to_me.return_value = False
+        self.telegram.updates.return_value = [self.update(text="/status@otherbot"),
+                                             {"update_id": 6, "edited_message": self.update()["message"]}]
+        with patch.object(self.commands, "status") as status:
+            self.commands.poll(1000)
+        status.assert_not_called()
+
+    def test_telegram_username_is_checked_and_cached(self):
+        call = Mock(return_value={"ok": True, "result": {"username": "MyBot"}})
+        telegram = bot.Telegram("secret", "123", call)
+        self.assertTrue(telegram.addressed_to_me("/status@mybot"))
+        self.assertFalse(telegram.addressed_to_me("/status@otherbot"))
+        call.assert_called_once()
+
+    def test_delivery_failure_does_not_acknowledge_command(self):
+        self.telegram.updates.return_value = [self.update()]
+        with patch.object(self.commands, "status", side_effect=bot.APIError("Telegram", 503)):
+            with self.assertRaises(bot.APIError):
+                self.commands.poll(1000)
+        self.assertEqual(self.commands.offset, 0)
+        self.assertFalse(self.path.exists())
+
+    def test_status_reports_each_server_and_honors_system_filter(self):
+        self.commands.system_id = "host2"
+        self.source.systems.return_value = [{"id": "host1"}, {"id": "host2"}]
+        with patch.object(bot, "status_report", side_effect=["Server 1", "Server 2"]):
+            self.commands.status(1000)
+        self.source.systems.assert_called_once_with("host2")
+        self.assertEqual([c.args[0] for c in self.telegram.send.call_args_list], ["Server 1", "Server 2"])
+
+    def test_beszel_outage_sends_clear_reply_without_secrets(self):
+        self.source.systems.side_effect = bot.APIError("Beszel", 503)
+        self.commands.status(1000)
+        self.assertIn("Не вдалося отримати метрики", self.telegram.send.call_args.args[0])
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-"""Telegram notifications from fresh Beszel samples; Python standard library only."""
+"""Beszel alerts and Telegram /status reports; Python standard library only."""
 
 import argparse
 from dataclasses import dataclass
@@ -84,18 +84,44 @@ class Beszel:
                           sort="-created", filter=f'system="{system_id}" && type="1m"')
         return result["items"][0] if result["items"] else None
 
+    def history(self, system_id, start, end):
+        if not system_id.isalnum():
+            raise ValueError("invalid system id")
+        page = 1
+        while True:
+            result = self.get(
+                "/api/collections/system_stats/records", page=page, perPage=200,
+                sort="created", filter=(f'system="{system_id}" && type="1m"'
+                                        f' && created>={int(start * 1000)}'
+                                        f' && created<={int(end * 1000)}'))
+            yield from result["items"]
+            if page >= result["totalPages"]:
+                return
+            page += 1
+
 
 class Telegram:
     def __init__(self, token, chat_id, call=http_json):
-        self.url = f"https://api.telegram.org/bot{token}/sendMessage"
+        self.api_url = f"https://api.telegram.org/bot{token}/"
+        self.url = self.api_url + "sendMessage"
         self.chat_id, self.call = chat_id, call
         self.retry_at = 0
+        self.username = None
 
     def send(self, message):
+        # Telegram limits message length. Split reports instead of dropping metrics.
+        while message:
+            end = len(message) if len(message) <= 4000 else message.rfind("\n", 0, 4001)
+            if end <= 0:
+                end = 4000
+            self._send(message[:end])
+            message = message[end:].lstrip("\n")
+
+    def _send(self, message):
         if time.time() < self.retry_at:
             raise APIError("Telegram rate limit", 429)
         try:
-            result = self.call(self.url, {"chat_id": self.chat_id, "text": message[:4000],
+            result = self.call(self.url, {"chat_id": self.chat_id, "text": message,
                                         "disable_notification": False}, service="Telegram")
         except APIError as exc:
             self.retry_at = time.time() + max(exc.retry_after, 30)
@@ -103,6 +129,25 @@ class Telegram:
         if result.get("ok") is not True:
             self.retry_at = time.time() + 30
             raise APIError("Telegram", result.get("error_code", 0))
+
+    def updates(self, offset):
+        result = self.call(self.api_url + "getUpdates", {
+            "offset": offset, "limit": 20, "timeout": 0,
+            "allowed_updates": ["message"],
+        }, service="Telegram")
+        if result.get("ok") is not True:
+            raise APIError("Telegram", result.get("error_code", 0))
+        return result["result"]
+
+    def addressed_to_me(self, command):
+        if "@" not in command:
+            return True
+        if self.username is None:
+            result = self.call(self.api_url + "getMe", service="Telegram")
+            if result.get("ok") is not True:
+                raise APIError("Telegram", result.get("error_code", 0))
+            self.username = result["result"]["username"]
+        return command.split("@", 1)[1].casefold() == self.username.casefold()
 
 
 @dataclass(frozen=True)
@@ -168,6 +213,89 @@ def sample_time(record):
         return value / 1000  # Beszel 0.21.0 stores system_stats.created in milliseconds.
     parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     return (parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)).timestamp()
+
+
+def status_report(beszel, system, now):
+    """Arithmetic means of available minute samples, never substituted zeroes."""
+    latest = beszel.latest(system["id"])
+    windows = {300: {}, 3600: {}}
+    names = {"cpu": "CPU", "ram": "RAM"}
+    seen = set()
+    for record in beszel.history(system["id"], now - 3600, now):
+        timestamp = sample_time(record)
+        if timestamp in seen or not now - 3600 < timestamp <= now:
+            continue
+        seen.add(timestamp)
+        metrics, _ = metrics_from(record["stats"])
+        for metric in metrics:
+            names[metric.key] = metric.name
+            for seconds, values in windows.items():
+                if timestamp > now - seconds:
+                    values.setdefault(metric.key, []).append(metric.value)
+    current = {}
+    if latest:
+        timestamp = sample_time(latest)
+        fresh = system.get("status") == "up" and 0 <= now - timestamp <= 180
+        label = "свіжий" if fresh else "застарілий / сервер недоступний"
+        updated = datetime.fromtimestamp(timestamp, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        for metric in metrics_from(latest["stats"])[0]:
+            names[metric.key] = metric.name
+            current[metric.key] = metric.value
+        stamp = f"Останній вимір: {updated} ({label})"
+    else:
+        stamp = "Останній вимір: немає даних"
+    lines = [f"📊 {str(system['name'])[:120]}", stamp,
+             "Метрика: останнє | середнє 5 хв | середнє 1 год"]
+    for key, name in names.items():
+        cells = [f"{current[key]:.1f}%" if key in current else "н/д"]
+        for values in windows.values():
+            samples = values.get(key, [])
+            cells.append(f"{sum(samples) / len(samples):.1f}% ({len(samples)})" if samples else "н/д")
+        lines.append(f"{name}: " + " | ".join(cells))
+    lines.append("Середні — за доступними хвилинними вимірами; у дужках їх кількість. "
+                 "Повні вікна: приблизно 5 та 60. н/д — немає даних.")
+    return "\n".join(lines)
+
+
+class Commands:
+    def __init__(self, path, telegram, beszel, system_id=""):
+        self.path, self.telegram, self.beszel = Path(path), telegram, beszel
+        self.system_id = system_id
+        self.offset = json.loads(self.path.read_text())["offset"] if self.path.exists() else 0
+
+    def poll(self, now):
+        for update in self.telegram.updates(self.offset):
+            if update["update_id"] < self.offset:
+                continue
+            message = update.get("message", {})
+            words = message.get("text", "").split()
+            command = words[0] if words else ""
+            # Only the configured chat may request server data. Skip old queued commands.
+            if (str(message.get("chat", {}).get("id")) == str(self.telegram.chat_id)
+                    and -30 <= now - message.get("date", 0) <= 300
+                    and command.split("@", 1)[0] == "/status"
+                    and self.telegram.addressed_to_me(command)):
+                self.status(now)
+            # A delivery failure leaves this update unacknowledged for retry.
+            self.offset = update["update_id"] + 1
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"offset": self.offset}))
+            tmp.replace(self.path)
+
+    def status(self, now):
+        try:
+            systems = list(self.beszel.systems(self.system_id))
+            if not systems:
+                self.telegram.send("Beszel: немає доступних систем для звіту.")
+            for system in systems:
+                self.telegram.send(status_report(self.beszel, system, now))
+        except APIError as exc:
+            if not str(exc).startswith("Beszel"):
+                raise
+            self.telegram.send("Не вдалося отримати метрики з Beszel. Спробуй /status пізніше.")
+        except (ValueError, KeyError, TypeError, OverflowError):
+            self.telegram.send("Beszel повернув некоректні дані. Спробуй /status пізніше.")
 
 
 class Alerts:
@@ -262,32 +390,47 @@ def main():
                     required("BESZEL_EMAIL"), required("BESZEL_PASSWORD"))
     telegram = Telegram(required("TELEGRAM_BOT_TOKEN"), required("TELEGRAM_CHAT_ID"))
     alerts = Alerts(state_dir / "alerts.json", telegram.send, repeat)
+    commands = Commands(state_dir / "commands.json", telegram, beszel,
+                        os.environ.get("BESZEL_SYSTEM_ID", ""))
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
     signal.signal(signal.SIGINT, lambda *_: stop.set())
     LOG.info("Monitoring started: CPU/GPU >95%%, RAM/VRAM >70%%, battery <35%%")
+    next_metrics = next_commands = 0
     while not stop.is_set():
         now = time.time()
-        try:
-            poll(beszel, alerts, now, os.environ.get("BESZEL_SYSTEM_ID", ""))
-            alerts.issue("api", False, "Зʼєднання бота з Beszel", now)
-        except APIError as exc:
-            LOG.warning("%s", exc)
-            # Telegram delivery failures must not masquerade as a Beszel outage.
-            if str(exc).startswith("Beszel"):
+        if now >= next_metrics:
+            next_metrics = now + interval
+            try:
+                poll(beszel, alerts, now, os.environ.get("BESZEL_SYSTEM_ID", ""))
+                alerts.issue("api", False, "Зʼєднання бота з Beszel", now)
+            except APIError as exc:
+                LOG.warning("%s", exc)
+                # Telegram delivery failures must not masquerade as a Beszel outage.
+                if str(exc).startswith("Beszel"):
+                    try:
+                        alerts.issue("api", True, "Бот не може отримати дані з Beszel", now)
+                    except APIError:
+                        LOG.warning("Telegram notification failed; will retry")
+            except (ValueError, KeyError, TypeError):
+                LOG.error("Invalid Beszel response; no alerts will be resolved from this data")
                 try:
-                    alerts.issue("api", True, "Бот не може отримати дані з Beszel", now)
+                    alerts.issue("api", True, "Бот отримує некоректні дані Beszel; перевір моніторинг", now)
                 except APIError:
                     LOG.warning("Telegram notification failed; will retry")
-        except (ValueError, KeyError, TypeError):
-            LOG.error("Invalid Beszel response; no alerts will be resolved from this data")
+            alerts.save()
+        if time.time() >= next_commands:
             try:
-                alerts.issue("api", True, "Бот отримує некоректні дані Beszel; перевір моніторинг", now)
-            except APIError:
-                LOG.warning("Telegram notification failed; will retry")
-        alerts.save()
+                commands.poll(time.time())
+                next_commands = time.time() + 2
+            except APIError as exc:
+                LOG.warning("Command polling: %s", exc)
+                next_commands = max(time.time() + max(exc.retry_after, 30), telegram.retry_at)
+            except (ValueError, KeyError, TypeError):
+                LOG.error("Invalid Telegram command response")
+                next_commands = time.time() + 30
         heartbeat.touch()
-        stop.wait(interval)
+        stop.wait(2)
     return 0
 
 
