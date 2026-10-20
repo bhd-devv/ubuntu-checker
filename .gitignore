@@ -35,6 +35,7 @@ id_rsa
 *.log
 
 # Local tooling and OS files.
+.idea/
 __pycache__/
 .venv/
 .cache/
