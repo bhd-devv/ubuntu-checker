@@ -102,6 +102,36 @@ class AlertsTest(unittest.TestCase):
         bot.poll(FakeBeszel(), self.alerts, 1200)
         self.assertEqual(self.messages, [])
 
+    def test_missing_metrics_stay_silent_across_polls_and_restart(self):
+        source = Mock()
+        source.systems.return_value = [{"id": "host1", "name": "Laptop", "status": "up"}]
+        for now in (1000, 1120, 2800, 4600):
+            source.latest.return_value = {"created": now * 1000, "stats": {"cpu": 10, "mp": 20}}
+            bot.poll(source, self.alerts, now)
+            self.alerts.save()
+            self.alerts = bot.Alerts(self.path, self.messages.append)
+        self.assertEqual(self.messages, [])
+
+    def test_legacy_missing_warning_stays_silent_and_thresholds_still_work(self):
+        self.alerts.state["issue:host1:missing"] = {"active": True, "sent": 1000}
+        self.alerts.save()
+        self.alerts = bot.Alerts(self.path, self.messages.append)
+        source = Mock()
+        source.systems.return_value = [{"id": "host1", "name": "Laptop", "status": "up"}]
+        source.latest.return_value = {"created": 2800 * 1000, "stats": {"cpu": 99, "mp": 20}}
+        bot.poll(source, self.alerts, 2800)
+        self.assertEqual(len(self.messages), 1)
+        self.assertIn("CPU: 99.0%", self.messages[0])
+
+        source.latest.return_value = {"created": 2830 * 1000, "stats": {
+            "cpu": 90, "mp": 20, "bat": [60, 1],
+            "g": {"0": {"u": 10, "mu": 20, "mt": 100}},
+        }}
+        bot.poll(source, self.alerts, 2830)
+        self.assertEqual(len(self.messages), 2)
+        self.assertIn("CPU: 90.0%", self.messages[1])
+        self.assertIn("відновлено", self.messages[1])
+
 
 class ParsingTest(unittest.TestCase):
     def test_multiple_gpu_vram_ratios_and_primary_laptop_battery(self):
@@ -194,12 +224,13 @@ class APITest(unittest.TestCase):
                 sender.send("test")
         self.assertEqual(sender.retry_at, 1120)
 
-    def test_telegram_updates_are_nonblocking_and_restricted_to_messages(self):
+    def test_telegram_updates_include_messages_and_channel_posts(self):
         call = Mock(return_value={"ok": True, "result": [{"update_id": 4}]})
         sender = bot.Telegram("secret", "123", call)
         self.assertEqual(sender.updates(3), [{"update_id": 4}])
         self.assertEqual(call.call_args.args[1], {
-            "offset": 3, "limit": 20, "timeout": 0, "allowed_updates": ["message"]})
+            "offset": 3, "limit": 20, "timeout": 0,
+            "allowed_updates": ["message", "channel_post"]})
 
     def test_long_reports_are_split_without_truncation(self):
         call = Mock(return_value={"ok": True})
@@ -279,8 +310,8 @@ class CommandsTest(unittest.TestCase):
         self.source = Mock()
         self.commands = bot.Commands(self.path, self.telegram, self.source)
 
-    def update(self, update_id=5, text="/status", chat=123, date=1000):
-        return {"update_id": update_id, "message": {"text": text, "chat": {"id": chat}, "date": date}}
+    def update(self, update_id=5, text="/status", chat=123, date=1000, kind="message"):
+        return {"update_id": update_id, kind: {"text": text, "chat": {"id": chat}, "date": date}}
 
     def test_only_configured_chat_and_fresh_status_are_processed(self):
         self.telegram.updates.return_value = [
@@ -301,6 +332,43 @@ class CommandsTest(unittest.TestCase):
             self.commands.poll(1000)
         status.assert_not_called()
 
+    def test_channel_status_posts_send_reports_to_configured_channel(self):
+        self.telegram.chat_id = "-1001234567890"
+        system = {"id": "host1", "name": "Laptop", "status": "up"}
+        self.source.systems.return_value = [system]
+        self.telegram.updates.return_value = [
+            self.update(1, chat=-1001234567890, kind="channel_post"),
+            self.update(2, text="/status@mybot", chat=-1001234567890, kind="channel_post"),
+        ]
+        with patch.object(bot, "status_report", return_value="Server report") as report:
+            self.commands.poll(1000)
+        self.assertEqual(report.call_count, 2)
+        report.assert_called_with(self.source, system, 1000)
+        self.assertEqual(self.telegram.send.call_args_list,
+                         [unittest.mock.call("Server report"), unittest.mock.call("Server report")])
+        self.assertEqual(bot.Commands(self.path, self.telegram, self.source).offset, 3)
+
+    def test_channel_posts_from_other_chats_old_posts_and_noncommands_are_ignored(self):
+        self.telegram.updates.return_value = [
+            self.update(1, chat=999, kind="channel_post"),
+            self.update(2, date=0, kind="channel_post"),
+            self.update(3, text="Server report", kind="channel_post"),
+            self.update(4, kind="edited_channel_post"),
+        ]
+        with patch.object(self.commands, "status") as status:
+            self.commands.poll(1000)
+        status.assert_not_called()
+        self.assertEqual(self.commands.offset, 5)
+
+    def test_channel_command_for_another_bot_is_ignored(self):
+        self.telegram.addressed_to_me.return_value = False
+        self.telegram.updates.return_value = [
+            self.update(text="/status@otherbot", kind="channel_post"),
+        ]
+        with patch.object(self.commands, "status") as status:
+            self.commands.poll(1000)
+        status.assert_not_called()
+
     def test_telegram_username_is_checked_and_cached(self):
         call = Mock(return_value={"ok": True, "result": {"username": "MyBot"}})
         telegram = bot.Telegram("secret", "123", call)
@@ -309,12 +377,14 @@ class CommandsTest(unittest.TestCase):
         call.assert_called_once()
 
     def test_delivery_failure_does_not_acknowledge_command(self):
-        self.telegram.updates.return_value = [self.update()]
-        with patch.object(self.commands, "status", side_effect=bot.APIError("Telegram", 503)):
-            with self.assertRaises(bot.APIError):
-                self.commands.poll(1000)
-        self.assertEqual(self.commands.offset, 0)
-        self.assertFalse(self.path.exists())
+        for kind in ("message", "channel_post"):
+            with self.subTest(kind=kind):
+                self.telegram.updates.return_value = [self.update(kind=kind)]
+                with patch.object(self.commands, "status", side_effect=bot.APIError("Telegram", 503)):
+                    with self.assertRaises(bot.APIError):
+                        self.commands.poll(1000)
+                self.assertEqual(self.commands.offset, 0)
+                self.assertFalse(self.path.exists())
 
     def test_status_reports_each_server_and_honors_system_filter(self):
         self.commands.system_id = "host2"

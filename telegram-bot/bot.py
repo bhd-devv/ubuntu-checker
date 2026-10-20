@@ -133,7 +133,7 @@ class Telegram:
     def updates(self, offset):
         result = self.call(self.api_url + "getUpdates", {
             "offset": offset, "limit": 20, "timeout": 0,
-            "allowed_updates": ["message"],
+            "allowed_updates": ["message", "channel_post"],
         }, service="Telegram")
         if result.get("ok") is not True:
             raise APIError("Telegram", result.get("error_code", 0))
@@ -267,7 +267,7 @@ class Commands:
         for update in self.telegram.updates(self.offset):
             if update["update_id"] < self.offset:
                 continue
-            message = update.get("message", {})
+            message = update.get("message") or update.get("channel_post", {})
             words = message.get("text", "").split()
             command = words[0] if words else ""
             # Only the configured chat may request server data. Skip old queued commands.
@@ -358,12 +358,9 @@ def poll(beszel, alerts, now, system_id=""):
                      f"{name}: свіжі метрики знову доступні")
         if stale:
             continue  # Neither alert nor resolve from stale values.
-        metrics, missing = metrics_from(record["stats"])
+        metrics, _ = metrics_from(record["stats"])
         for metric in metrics:
             alerts.metric(sid, name, metric, now)
-        alerts.issue(sid + ":missing", bool(missing),
-                     f"{name}: недоступні метрики: {', '.join(missing)}. Перевір доступ агента до GPU/батареї", now,
-                     f"{name}: CPU/GPU/RAM/VRAM і батарея доступні")
 
 
 def required(name):
