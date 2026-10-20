@@ -31,7 +31,8 @@ services:
     logging: *logging
 
   prometheus:
-    image: prom/prometheus:v3.15.0
+    build:
+      context: ./prometheus
     restart: unless-stopped
     command:
       - --config.file=/etc/prometheus/prometheus.yml
@@ -41,8 +42,6 @@ services:
       - --web.listen-address=0.0.0.0:9090
     volumes:
       - prometheus-data:/prometheus
-      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - ./prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
     extra_hosts:
       - "node-host:${NODE_EXPORTER_HOST:-172.17.0.1}"
     depends_on:

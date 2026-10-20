@@ -1,4 +1,4 @@
-# This stack pulls published images; these exclusions also protect future builds.
+# Exclude secrets and runtime data from build contexts.
 .git
 .gitignore
 

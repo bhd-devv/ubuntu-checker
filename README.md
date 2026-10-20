@@ -77,7 +77,7 @@ Prometheus та експортери працюють уже на першому
 1. Завантаж усі файли проєкту в Git-репозиторій. `.env` із секретами не коміть.
 2. У Coolify створи **Git Repository application** на потрібному сервері з build pack / strategy **Docker Compose**.
 3. Задай **Base Directory** `/`, початковий **Docker Compose Location** `/compose.setup.yml`.
-4. Увімкни **Preserve repository during deployment / Preserve Repository**: фінальний стек монтує конфігурації Prometheus із Git.
+4. Переконайся, що в Git є `prometheus/Dockerfile`, `prometheus/prometheus.yml` та `prometheus/alerts.yml`. Coolify збирає образ Prometheus із цими конфігураціями; **Preserve Repository** для цього більше не потрібен. Під час збірки `promtool` перевіряє конфігурацію та правила.
 5. У **Environment Variables** встанови:
 
    | Змінна | Значення |
@@ -273,7 +273,7 @@ docker compose -f docker-compose.yml -f compose.local.yml up -d
 - **Agent / система Down:** перевір публічний ключ, Host `/beszel_socket/beszel.sock` у Beszel та однаковий volume `beszel-socket` у Hub і Agent. Після зміни env зроби redeploy.
 - **`bind: cannot assign requested address` у Node Exporter:** перевір IPv4 `docker0` та `NODE_EXPORTER_HOST`.
 - **Node target Down:** перевір адресу `node-host`, listener Node Exporter і firewall між Docker-мережею та хостом.
-- **Помилка монтування конфігурацій:** увімкни Preserve Repository; перевір, чи існують `prometheus/prometheus.yml` та `prometheus/alerts.yml` як файли.
+- **Помилка монтування `/etc/prometheus/prometheus.yml`:** онови Compose із Git: конфігурації тепер включені в образ через `prometheus/Dockerfile`, а Prometheus монтує лише volume даних `/prometheus`. Прибери старі монтування конфігурацій зі Storage у Coolify, якщо додавав їх вручну, та зроби redeploy. Видаляти `prometheus-data` не потрібно.
 - **`Invalid volume source: contains forbidden character '${'`:** використовуй явні шляхи у volumes. У cAdvisor має бути `/var/lib/docker:/var/lib/docker:ro` (або фактичний DockerRootDir з обох боків) в обох Compose-файлах. Збережи виправлення в Git і перезавантаж Compose у Coolify.
 - **Немає метрик контейнерів:** перевір Docker socket, rootful Docker, DockerRootDir і логи агента/cAdvisor.
 - **No available server:** перевір healthy у Hub та привʼязку домену до **beszel:8090**.
