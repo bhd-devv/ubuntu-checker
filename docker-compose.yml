@@ -69,6 +69,7 @@ services:
     init: true
     environment:
       BESZEL_URL: http://beszel:8090
+      PROMETHEUS_URL: http://prometheus:9090
       BESZEL_EMAIL: ${TELEGRAM_BESZEL_EMAIL:-${BESZEL_USER_EMAIL}}
       BESZEL_PASSWORD: ${TELEGRAM_BESZEL_PASSWORD:-${BESZEL_USER_PASSWORD}}
       BESZEL_SYSTEM_ID: ${TELEGRAM_BESZEL_SYSTEM_ID:-}
