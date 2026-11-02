@@ -1,3 +1,4 @@
+import base64
 import io
 import json
 from pathlib import Path
@@ -176,21 +177,23 @@ class APITest(unittest.TestCase):
 
     def test_beszel_renews_expired_auth_and_filters_raw_samples(self):
         calls = []
+        new_token = "header." + base64.urlsafe_b64encode(json.dumps({"exp": 9999999999}).encode()).decode().rstrip("=") + ".signature"
         def fake(url, body=None, token=None, **_):
             calls.append((url, body, token))
             if body:
-                return {"token": "new"}
+                return {"token": new_token}
             if token == "expired":
                 raise bot.APIError("Beszel", 401)
             return {"items": [{"stats": {"cpu": 96}}]}
         client = bot.Beszel("http://beszel:8090", "bot@example.com", "test-password")
         client.token = "expired"
+        client.token_expires_at = 9999999999  # Revoked token before local expiry: exercise HTTP 401.
         with patch.object(bot, "http_json", side_effect=fake):
             self.assertEqual(client.latest("abc123")["stats"]["cpu"], 96)
         params = parse_qs(urlsplit(calls[-1][0]).query)
         self.assertEqual(params["filter"], ['system="abc123" && type="1m"'])
         self.assertEqual(params["sort"], ["-created"])
-        self.assertEqual(client.token, "new")
+        self.assertEqual(client.token, new_token)
 
     def test_pagination_and_system_filter(self):
         client = bot.Beszel("http://beszel", "email", "password")
