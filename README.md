@@ -247,7 +247,7 @@ ssh -N -L 9090:PROMETHEUS_CONTAINER_IP:9090 user@server
 Звичайний redeploy зберігає volumes. Не використовуй `docker compose down -v` і не видаляй volumes у Coolify, якщо потрібна історія.
 Роби резервні копії бази Beszel та даних Prometheus; retention не замінює backup.
 
-Ліміти RAM: Hub 256 MiB, Agent 128 MiB, Telegram-бот 128 MiB, Prometheus 1 GiB, cAdvisor 512 MiB, Node Exporter 128 MiB.
+Ліміти RAM: Hub 256 MiB, Agent 128 MiB, Telegram-бот 128 MiB, Prometheus 1 GiB, cAdvisor 1 GiB, Node Exporter 128 MiB.
 Це верхні межі, не резервування. Реальне споживання залежить від кількості контейнерів та метрик.
 Логи кожного сервісу обмежені трьома файлами по 10 MB. Версії образів зафіксовані.
 
