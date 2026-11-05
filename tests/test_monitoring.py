@@ -274,6 +274,29 @@ class PrometheusTest(StateTestCase):
             self.poll(changed, 1030)
         self.assertEqual(len(self.messages), 1)
 
+    def test_removed_disk_rules_are_retired_across_restart_without_false_recovery(self):
+        for rule in ("HostDiskSpaceLow", "HostDiskInodesLow"):
+            self.alerts.state["issue:prometheus:" + rule] = {
+                "active": True, "sent": 900, "rule": rule, "message": "Disk warning",
+            }
+        self.alerts.save()
+        self.alerts = bot.Alerts(self.path, self.messages.append)
+        self.poll(self.response([self.item()]))
+        self.assertEqual(len(self.messages), 1)
+        self.assertIn("Exporter unavailable", self.messages[0])
+        self.assertEqual(len(self.alerts.state), 1)
+        self.alerts.save()
+        self.assertEqual(bot.Alerts(self.path, self.messages.append).state, self.alerts.state)
+
+    def test_unhealthy_rules_do_not_retire_disk_incidents(self):
+        key = "issue:prometheus:disk"
+        incident = {"active": True, "sent": 900, "rule": "HostDiskSpaceLow"}
+        self.alerts.state[key] = incident.copy()
+        with self.assertRaises(bot.APIError):
+            self.poll(self.response(health="err"))
+        self.assertEqual(self.alerts.state[key], incident)
+        self.assertEqual(self.messages, [])
+
 
 class MonitorTest(StateTestCase):
     def monitor(self):

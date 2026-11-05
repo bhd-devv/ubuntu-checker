@@ -37,24 +37,6 @@ groups:
           summary: "Доступно менше 10% RAM"
           description: "На {{ $labels.instance }} мало доступної памʼяті понад 5 хвилин."
 
-      - alert: HostDiskSpaceLow
-        expr: (100 * node_filesystem_avail_bytes{job="node",fstype!~"tmpfs|devtmpfs|overlay|squashfs|nsfs"} / node_filesystem_size_bytes{job="node"} < 15) and on (instance,device,mountpoint) (node_filesystem_readonly{job="node"} == 0)
-        for: 10m
-        labels:
-          severity: warning
-        annotations:
-          summary: "На {{ $labels.mountpoint }} менше 15% вільного місця"
-          description: "Перевірте Docker volumes, образи, логи та дані Prometheus."
-
-      - alert: HostDiskInodesLow
-        expr: (100 * node_filesystem_files_free{job="node",fstype!~"tmpfs|devtmpfs|overlay|squashfs|nsfs"} / node_filesystem_files{job="node"} < 10) and on (instance,device,mountpoint) (node_filesystem_readonly{job="node"} == 0)
-        for: 10m
-        labels:
-          severity: warning
-        annotations:
-          summary: "На {{ $labels.mountpoint }} менше 10% вільних inode"
-          description: "Диск може перестати приймати нові файли навіть за наявності вільних байтів."
-
       - alert: HostOOMKill
         expr: increase(node_vmstat_oom_kill{job="node"}[5m]) > 0
         labels:

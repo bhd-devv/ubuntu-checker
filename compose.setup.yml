@@ -70,7 +70,7 @@ services:
       - --path.procfs=/host/proc
       - --path.sysfs=/host/sys
       - --web.listen-address=${NODE_EXPORTER_HOST:-172.17.0.1}:9100
-      - --collector.filesystem.mount-points-exclude=^/(dev|proc|sys|run|var/lib/docker|var/lib/containers)($$|/)
+      - --no-collector.filesystem
       - --collector.netdev.device-exclude=^(lo|veth.*|docker.*|br-.*)$$
       - --no-collector.timex
     environment:
@@ -98,7 +98,8 @@ services:
       - --housekeeping_interval=30s
       - --store_container_labels=false
       - --docker=${DOCKER_ENDPOINT:-unix:///var/run/docker.sock}
-      - --disable_metrics=advtcp,cpu_topology,cpuset,hugetlb,memory_numa,percpu,referenced_memory,resctrl,sched,tcp,udp
+      # Skip container filesystem walks and their inode/dentry cache overhead.
+      - --disable_metrics=advtcp,cpu_topology,cpuset,disk,hugetlb,memory_numa,percpu,referenced_memory,resctrl,sched,tcp,udp
     volumes:
       - /:/rootfs:ro
       - /var/run:/var/run:ro

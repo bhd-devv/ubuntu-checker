@@ -17,6 +17,8 @@ import traceback
 from urllib import error, parse, request
 
 LOG = logging.getLogger("telegram-bot")
+# Intentionally removed rules may still have incidents in the persistent volume.
+RETIRED_PROMETHEUS_RULES = frozenset({"HostDiskSpaceLow", "HostDiskInodesLow"})
 
 
 class ConfigError(ValueError):
@@ -586,7 +588,8 @@ class Prometheus:
         if not names:
             raise ValueError("no Prometheus alert rules loaded")
         missing = {item["rule"] for key, item in alerts.state.items()
-                   if key.startswith("issue:prometheus:") and "rule" in item and item["rule"] not in names}
+                   if key.startswith("issue:prometheus:") and "rule" in item
+                   and item["rule"] not in names and item["rule"] not in RETIRED_PROMETHEUS_RULES}
         if missing:
             LOG.error("Previously alerting Prometheus rules disappeared rules=%s", ",".join(sorted(missing)))
             raise APIError("Prometheus", operation="rules", reason="previously alerting rules are missing")
@@ -598,6 +601,10 @@ class Prometheus:
             raise APIError("Prometheus", operation="rule evaluation", reason="one or more rules unhealthy")
         for key, item in list(alerts.state.items()):
             if key.startswith("issue:prometheus:") and key[6:] not in firing:
+                if item.get("rule") in RETIRED_PROMETHEUS_RULES and item["rule"] not in names:
+                    LOG.info("Removed incident for retired Prometheus rule=%s", item["rule"])
+                    del alerts.state[key]
+                    continue
                 alerts.issue(key[6:], False, "", now,
                              "Prometheus: умова тривоги більше не активна\n" + item.get("message", key[6:]))
 

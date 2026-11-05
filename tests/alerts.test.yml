@@ -45,31 +45,6 @@ tests:
           - labels: '{}'
             value: 1
 
-  - name: Low disk only alerts for writable filesystems
-    interval: 1m
-    input_series:
-      - series: 'node_filesystem_avail_bytes{job="node",instance="node-host:9100",device="/dev/sda1",mountpoint="/",fstype="ext4"}'
-        values: '5+0x30'
-      - series: 'node_filesystem_size_bytes{job="node",instance="node-host:9100",device="/dev/sda1",mountpoint="/",fstype="ext4"}'
-        values: '100+0x30'
-      - series: 'node_filesystem_readonly{job="node",instance="node-host:9100",device="/dev/sda1",mountpoint="/",fstype="ext4"}'
-        values: '0+0x30'
-      - series: 'node_filesystem_avail_bytes{job="node",instance="node-host:9100",device="/dev/sdb1",mountpoint="/archive",fstype="ext4"}'
-        values: '5+0x30'
-      - series: 'node_filesystem_size_bytes{job="node",instance="node-host:9100",device="/dev/sdb1",mountpoint="/archive",fstype="ext4"}'
-        values: '100+0x30'
-      - series: 'node_filesystem_readonly{job="node",instance="node-host:9100",device="/dev/sdb1",mountpoint="/archive",fstype="ext4"}'
-        values: '1+0x30'
-    promql_expr_test:
-      - expr: 'count(ALERTS{alertname="HostDiskSpaceLow",alertstate="firing",mountpoint="/"})'
-        eval_time: 15m
-        exp_samples:
-          - labels: '{}'
-            value: 1
-      - expr: 'ALERTS{alertname="HostDiskSpaceLow",alertstate="firing",mountpoint="/archive"}'
-        eval_time: 15m
-        exp_samples: []
-
   - name: Exporter outage is detected
     interval: 1m
     input_series:
