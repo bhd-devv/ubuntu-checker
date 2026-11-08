@@ -9,6 +9,7 @@ from urllib.error import URLError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "telegram-bot"))
 import bot
+from storage_support import events, open_alerts
 
 
 def jwt(expires):
@@ -120,25 +121,33 @@ class StateTestCase(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.path = Path(self.tmp.name) / "alerts.json"
-        self.messages = []
-        self.alerts = bot.Alerts(self.path, self.messages.append)
+        self.delivered = []
+        self.alerts = self.open_alerts()
         self.diagnostics = bot.Diagnostics(self.alerts)
+
+    def open_alerts(self):
+        return open_alerts(self, self.path, self.delivered.append)
+
+    @property
+    def messages(self):
+        self.alerts.save()
+        return [event.message for event in events(self.alerts)]
 
 
 class IncidentTest(StateTestCase):
     def test_failure_repeat_recovery_and_restart(self):
         self.diagnostics.fail("api", "API failure", bot.APIError("Beszel", 503), 1000)
-        self.diagnostics.flush(1000)
         self.diagnostics.fail("api", "API failure", bot.APIError("Beszel", 503), 1030)
         self.alerts.save()
-        self.alerts = bot.Alerts(self.path, self.messages.append)
+        self.alerts = self.open_alerts()
         self.diagnostics = bot.Diagnostics(self.alerts)
-        self.diagnostics.flush(1030)
-        self.assertEqual(len(self.messages), 1)
-        self.diagnostics.flush(2800)
         self.assertEqual(len(self.messages), 2)
+        self.assertFalse(self.alerts.flush(1299))
+        self.assertTrue(self.alerts.flush(1300))
+        self.assertEqual(len(self.delivered), 1)
+        self.assertIn("невдалих спроб: 2", self.delivered[0])
         self.diagnostics.recover("api", 2810)
-        self.diagnostics.flush(2810)
+        self.alerts.flush(2810)
         self.assertEqual(len(self.messages), 3)
         self.assertIn("Роботу відновлено", self.messages[-1])
         self.assertIn("невдалих спроб: 2", self.messages[-1])
@@ -147,20 +156,21 @@ class IncidentTest(StateTestCase):
     def test_telegram_outage_survives_restart_and_reports_after_recovery(self):
         self.diagnostics.fail("api", "API failure", bot.APIError("Beszel", 503), 1000)
         self.alerts.send = Mock(side_effect=bot.APIError("Telegram", 503))
-        self.diagnostics.flush(1000)
-        self.assertNotIn("sent", self.alerts.state["diagnostic:api"])
-        self.alerts.save()
-        alerts = bot.Alerts(self.path, self.messages.append)
-        diagnostics = bot.Diagnostics(alerts)
-        diagnostics.recover("api", 1100)
-        diagnostics.flush(1100)
+        with self.assertRaises(bot.APIError):
+            self.alerts.flush(1300)
+        self.alerts = self.open_alerts()
+        diagnostics = bot.Diagnostics(self.alerts)
+        diagnostics.recover("api", 1400)
+        self.assertFalse(self.alerts.flush(1400))
+        self.assertTrue(self.alerts.flush(1600))
         self.assertEqual(len(self.messages), 2)
-        self.assertTrue(all("Роботу відновлено" in msg for msg in self.messages))
-        self.assertEqual(alerts.state, {})
+        self.assertEqual(len(self.delivered), 1)
+        self.assertIn("Роботу відновлено", self.delivered[0])
+        self.assertEqual(self.alerts.state, {})
 
     def test_repaired_auth_event_deduplicates_across_restart(self):
         self.diagnostics.event("auth", "repaired", 1000)
-        alerts = bot.Alerts(self.path, self.messages.append)
+        alerts = self.open_alerts()
         bot.Diagnostics(alerts).event("auth", "repaired", 1030)
         self.assertEqual(self.messages, ["✅ repaired"])
 
@@ -170,23 +180,24 @@ class IncidentTest(StateTestCase):
         except ValueError as exc:
             with self.assertLogs(bot.LOG, level="ERROR") as logs:
                 self.diagnostics.fail("parser", "Parser error", exc, 1000)
-        self.diagnostics.flush(1000)
+        self.alerts.flush(1300)
         output = " ".join(logs.output + self.messages)
         self.assertNotIn("SECRET_PASSWORD", output)
         self.assertIn("ValueError", output)
         self.assertIn("test_monitoring.py", output)
 
     def test_corrupted_state_is_preserved_and_reported(self):
+        self.path = self.path.parent / "legacy.json"
         self.path.write_text('{"SECRET":')
-        alerts = bot.Alerts(self.path, self.messages.append)
-        self.assertEqual(alerts.state, {})
-        self.assertIsInstance(alerts.load_error, ValueError)
-        self.assertEqual(len(list(self.path.parent.glob("alerts.json.corrupt-*"))), 1)
+        self.alerts = self.open_alerts()
+        self.assertEqual(self.alerts.state, {})
+        self.assertIsInstance(self.alerts.load_error, ValueError)
+        self.assertEqual(len(list(self.path.parent.glob("legacy.json.corrupt-*"))), 1)
         telegram = Mock(retry_at=0)
         source = Mock(events=[])
         commands = Mock(load_error=None)
-        monitor = bot.Monitor(source, telegram, alerts, commands)
-        monitor.diagnostics.flush(bot.time.time())
+        bot.Monitor(source, telegram, self.alerts, commands)
+        self.alerts.flush(1300)
         self.assertIn("Пошкоджений файл стану", self.messages[-1])
         self.assertNotIn("SECRET", self.messages[-1])
 
@@ -247,7 +258,7 @@ class PrometheusTest(StateTestCase):
     def test_firing_state_survives_restart_and_preserves_recovery_context(self):
         self.poll(self.response([self.item()]))
         self.alerts.save()
-        self.alerts = bot.Alerts(self.path, self.messages.append)
+        self.alerts = self.open_alerts()
         self.poll(self.response([self.item()]), 1030)
         self.assertEqual(len(self.messages), 1)
         self.poll(self.response(), 1060)
@@ -280,13 +291,13 @@ class PrometheusTest(StateTestCase):
                 "active": True, "sent": 900, "rule": rule, "message": "Disk warning",
             }
         self.alerts.save()
-        self.alerts = bot.Alerts(self.path, self.messages.append)
+        self.alerts = self.open_alerts()
         self.poll(self.response([self.item()]))
         self.assertEqual(len(self.messages), 1)
         self.assertIn("Exporter unavailable", self.messages[0])
         self.assertEqual(len(self.alerts.state), 1)
         self.alerts.save()
-        self.assertEqual(bot.Alerts(self.path, self.messages.append).state, self.alerts.state)
+        self.assertEqual(self.open_alerts().state, self.alerts.state)
 
     def test_unhealthy_rules_do_not_retire_disk_incidents(self):
         key = "issue:prometheus:disk"
@@ -313,7 +324,7 @@ class MonitorTest(StateTestCase):
         self.prometheus.poll.assert_called_once()
         self.commands.poll.assert_called_once()
         self.assertIn("Помилка перевірки метрик Beszel", self.messages[0])
-        self.assertTrue(self.path.exists())
+        self.assertIsNotNone(self.alerts.store.load())
 
     def test_delivery_failure_is_not_classified_as_beszel_failure(self):
         monitor = self.monitor()
@@ -348,11 +359,17 @@ class MonitorTest(StateTestCase):
         self.alerts.send = Mock(side_effect=bot.APIError("Telegram", 503))
         with patch.object(bot, "poll"):
             monitor.tick(1000)
-            self.assertEqual(self.source.events, ["Authentication repaired"])
-            self.alerts.send = self.messages.append
-            monitor.tick(1002)
+            self.assertEqual(self.source.events, [])  # Durable recording does not wait for delivery.
+            monitor.tick(1300)
+            self.alerts.send.assert_called_once()
+            self.alerts.send = self.delivered.append
+            monitor.tick(1302)
+            self.assertEqual(self.delivered, [])
+            monitor.tick(1600)
         self.assertEqual(self.source.events, [])
         self.assertIn("Authentication repaired", self.messages[0])
+        self.assertEqual(len(self.delivered), 1)
+        self.assertIn("Authentication repaired", self.delivered[0])
 
     def test_command_polling_waits_for_shared_telegram_rate_limit(self):
         monitor = self.monitor()
@@ -373,7 +390,7 @@ class MonitorTest(StateTestCase):
             monitor.tick(1004)
         self.assertTrue(any("errno=28" in m for m in self.messages))
         self.assertNotIn("diagnostic:storage", self.alerts.state)
-        self.assertTrue(self.path.exists())
+        self.assertIsNotNone(self.alerts.store.load())
 
 
 if __name__ == "__main__":

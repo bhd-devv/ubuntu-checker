@@ -1,3 +1,5 @@
 *
 !Dockerfile
 !bot.py
+!notifications.py
+!requirements.txt

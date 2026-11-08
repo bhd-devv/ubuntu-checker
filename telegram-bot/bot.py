@@ -1,4 +1,4 @@
-"""Beszel alerts and Telegram /status reports; Python standard library only."""
+"""Beszel alerts, durable notification digests and Telegram /status reports."""
 
 import argparse
 import base64
@@ -15,6 +15,10 @@ import threading
 import time
 import traceback
 from urllib import error, parse, request
+
+from sqlalchemy.engine import URL
+
+from notifications import NotificationStore
 
 LOG = logging.getLogger("telegram-bot")
 # Intentionally removed rules may still have incidents in the persistent volume.
@@ -435,26 +439,47 @@ class Commands:
 
 
 class Alerts:
-    def __init__(self, path, send, repeat=1800):
+    def __init__(self, path, send, repeat=1800, digest_interval=300, now=None, database_url=None):
         self.path, self.send, self.repeat = Path(path), send, repeat
-        self.state, self.load_error = load_state(self.path, valid_alert_state)
-        self.saved_state = None
+        # File-backed ORM storage is used by unit tests; main() always requires PostgreSQL.
+        if database_url is None:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            database_url = URL.create("sqlite+pysqlite", database=str(self.path.with_suffix(".orm.sqlite3")))
+        self.store = NotificationStore(database_url, time.time() if now is None else now,
+                                       digest_interval, legacy_path=self.path.with_suffix(".sqlite3"))
+        self.pending_events = []
+        self.load_error = None
+        self.state = self.store.load()
+        if self.state is None:
+            # Import the previous JSON once; leave the original file as a backup.
+            self.state, self.load_error = load_state(self.path, valid_alert_state)
+            for key, item in self.state.items():
+                if key.startswith("diagnostic:"):
+                    self.record(key, Diagnostics.message(item, item.get("ended", item.get("last", item["since"]))),
+                                item["since"])
+            self.state = {key: item for key, item in self.state.items()
+                          if not key.startswith("diagnostic:") or item["active"]}
+            self.save()
+        elif not isinstance(self.state, dict) or not valid_alert_state(self.state):
+            self.store.close()
+            raise ConfigError("Invalid alert state in notification database; preserve database for diagnosis")
 
     def save(self):
-        serialized = json.dumps(self.state, ensure_ascii=False)
-        if serialized == self.saved_state:
-            return
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(serialized)
-        tmp.replace(self.path)
-        self.saved_state = serialized
+        self.store.save(self.state, self.pending_events)
+        self.pending_events.clear()
+
+    def record(self, key, message, now):
+        self.pending_events.append((key, message, now))
+
+    def flush(self, now):
+        self.save()
+        return self.store.flush(self.send, now)
 
     def notify(self, key, active, message, now):
         LOG.log(logging.WARNING if active else logging.INFO,
-                "Alert delivery key=%s active=%s message=%s", key, active, message.replace("\n", " | "))
-        # Update deduplication state only after Telegram confirms delivery.
-        self.send(message)
+                "Alert queued key=%s active=%s message=%s", key, active, message.replace("\n", " | "))
+        self.record(key, message, now)
+        # Deduplication tracks durable recording, independently of Telegram delivery.
         self.state[key] = {"active": active, "sent": now}
         self.save()
 
@@ -494,7 +519,7 @@ class Alerts:
 
 
 class Diagnostics:
-    """Persist incidents even when Telegram itself is unavailable; no recursive sends."""
+    """Record failures and recovery locally; only the digest contacts Telegram."""
 
     def __init__(self, alerts):
         self.alerts = alerts
@@ -505,12 +530,11 @@ class Diagnostics:
         key = "diagnostic:" + key
         old = self.alerts.state.get(key, {})
         if not old.get("active"):
-            # Preserve a pending recovery if the incident recurs before delivery.
-            old = {"since": old.get("since", now), "count": old.get("count", 0),
-                   **({"sent": old["sent"]} if "sent" in old else {})}
+            old = {"since": now, "count": 0}
         old.update(active=True, message=message, error=detail, last=now,
                    count=old.get("count", 0) + 1)
         self.alerts.state[key] = old
+        self.alerts.record(key, self.message(old, now), now)
 
     def recover(self, key, now):
         item = self.alerts.state.get("diagnostic:" + key)
@@ -518,6 +542,8 @@ class Diagnostics:
             LOG.info("Operation recovered key=%s failures=%s duration=%.0fs",
                      key, item["count"], now - item["since"])
             item.update(active=False, ended=now)
+            self.alerts.record("diagnostic:" + key, self.message(item, now), now)
+            del self.alerts.state["diagnostic:" + key]
 
     def event(self, key, message, now):
         key = "event:" + key
@@ -525,31 +551,14 @@ class Diagnostics:
         if not old or now - old.get("sent", 0) >= self.alerts.repeat:
             self.alerts.notify(key, False, "✅ " + message, now)
 
-    def flush(self, now):
-        for key, item in list(self.alerts.state.items()):
-            if not key.startswith("diagnostic:"):
-                continue
-            if item["active"] and "sent" in item and now - item["sent"] < self.alerts.repeat:
-                continue
-            # Successfully delivering this message itself proves delivery recovery.
-            active = item["active"] and key != "diagnostic:telegram-delivery"
-            duration = int(item.get("ended", now) - item["since"])
-            prefix = "⚠️" if active else "✅"
-            status = "Збій триває" if active else "Роботу відновлено"
-            message = (f"{prefix} {item['message']}\n{status}; тривалість: {duration} с; "
-                       f"невдалих спроб: {item['count']}.\nПричина: {item['error']}")
-            try:
-                self.alerts.send(message)
-            except APIError as exc:
-                self.fail("telegram-delivery", "Не вдалося доставити повідомлення Telegram", exc, now)
-                return
-            if active:
-                item["sent"] = now
-            else:
-                del self.alerts.state[key]
-            self.recover("telegram-delivery", now)
-            LOG.info("Diagnostic delivered key=%s active=%s failures=%s", key, active, item["count"])
-            self.alerts.save()
+    @staticmethod
+    def message(item, now):
+        active = item["active"]
+        prefix = "⚠️" if active else "✅"
+        status = "Збій триває" if active else "Роботу відновлено"
+        duration = int(item.get("ended", now) - item["since"])
+        return (f"{prefix} {item['message']}\n{status}; тривалість: {duration} с; "
+                f"невдалих спроб: {item['count']}.\nПричина: {item['error']}")
 
 
 class Prometheus:
@@ -634,6 +643,12 @@ def required(name):
     return value
 
 
+def notification_database_url():
+    # URL.create escapes passwords containing @, /, :, %, or other URL characters.
+    return URL.create("postgresql+psycopg", username=required("PGUSER"), password=required("PGPASSWORD"),
+                      host=required("PGHOST"), database=required("PGDATABASE"))
+
+
 class Monitor:
     def __init__(self, beszel, telegram, alerts, commands, prometheus=None, interval=30, system_id=""):
         self.beszel, self.telegram, self.alerts, self.commands = beszel, telegram, alerts, commands
@@ -673,22 +688,24 @@ class Monitor:
         if now >= max(self.next_commands, self.telegram.retry_at):
             exc = self.attempt("commands", "Помилка обробки команд Telegram",
                                lambda: self.commands.poll(now), now)
-            self.next_commands = max(now + (max(30, getattr(exc, "retry_after", 0)) if exc else 2),
+            self.next_commands = max(now + max(30, getattr(exc, "retry_after", 0)),
                                      self.telegram.retry_at)
+        # Recording local events never waits for Telegram's rate limit or availability.
+        while self.beszel.events:
+            message = self.beszel.events[0]
+            exc = self.attempt("auth-event", "Помилка запису звіту про авторизацію",
+                               lambda: self.diagnostics.event("beszel-auth", message, now), now)
+            if exc:
+                break
+            self.beszel.events.pop(0)
         if now >= self.telegram.retry_at:
-            # Events are removed only after confirmed delivery (or deduplication).
-            while self.beszel.events:
-                message = self.beszel.events[0]
-                exc = self.attempt("auth-event", "Помилка доставки звіту про авторизацію",
-                                   lambda: self.diagnostics.event("beszel-auth", message, now), now)
-                if exc:
-                    break
-                self.beszel.events.pop(0)
-            if now >= self.telegram.retry_at:
-                self.attempt("diagnostics", "Помилка доставки діагностики",
-                             lambda: self.diagnostics.flush(now), now)
+            self.attempt("digest", "Помилка доставки зведення Telegram", lambda: self.digest(now), now)
         self.attempt("storage", "Не вдалося зберегти стан бота",
                      self.alerts.save, now)
+
+    def digest(self, now):
+        if self.alerts.flush(now):
+            self.diagnostics.recover("telegram-delivery", now)
 
     def metrics(self, now):
         poll(self.beszel, self.alerts, now, self.system_id)
@@ -716,7 +733,7 @@ def main():
     beszel = Beszel(os.environ.get("BESZEL_URL", "http://beszel:8090"),
                     required("BESZEL_EMAIL"), required("BESZEL_PASSWORD"))
     telegram = Telegram(required("TELEGRAM_BOT_TOKEN"), required("TELEGRAM_CHAT_ID"))
-    alerts = Alerts(state_dir / "alerts.json", telegram.send, repeat)
+    alerts = Alerts(state_dir / "alerts.json", telegram.send, repeat, database_url=notification_database_url())
     commands = Commands(state_dir / "commands.json", telegram, beszel,
                         os.environ.get("BESZEL_SYSTEM_ID", ""))
     prometheus_url = os.environ.get("PROMETHEUS_URL", "").strip()
@@ -727,12 +744,18 @@ def main():
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
     signal.signal(signal.SIGINT, lambda *_: stop.set())
     LOG.info("Monitoring started: CPU/GPU >95%%, RAM/VRAM >70%%, battery <35%%; "
-             "poll=%ss repeat=%ss prometheus=%s", interval, repeat, bool(prometheus_url))
-    while not stop.is_set():
-        now = time.time()
-        monitor.tick(now)
-        monitor.attempt("heartbeat", "Не вдалося записати heartbeat бота", heartbeat.touch, now)
-        stop.wait(2)
+             "poll=%ss repeat=%ss digest=300s commands=30s prometheus=%s", interval, repeat, bool(prometheus_url))
+    try:
+        while not stop.is_set():
+            now = time.time()
+            monitor.tick(now)
+            monitor.attempt("heartbeat", "Не вдалося записати heartbeat бота", heartbeat.touch, now)
+            stop.wait(2)
+    finally:
+        try:
+            alerts.save()
+        finally:
+            alerts.store.close()
     LOG.info("Monitoring stopped by signal")
     return 0
 
@@ -744,7 +767,8 @@ if __name__ == "__main__":
         LOG.critical("Bot startup/runtime failure error=%s", error_detail(exc))
         try:
             telegram = Telegram(required("TELEGRAM_BOT_TOKEN"), required("TELEGRAM_CHAT_ID"))
-            alerts = Alerts(Path(os.environ.get("STATE_DIR", "/data")) / "alerts.json", telegram.send)
+            alerts = Alerts(Path(os.environ.get("STATE_DIR", "/data")) / "alerts.json", telegram.send,
+                            database_url=notification_database_url())
             alerts.issue("startup", True, "Бот не зміг запуститися або аварійно зупинився: "
                          + error_detail(exc), time.time(), grace=0)
         except Exception as delivery_error:

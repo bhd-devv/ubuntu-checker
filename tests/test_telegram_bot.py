@@ -11,15 +11,24 @@ from urllib.parse import parse_qs, urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "telegram-bot"))
 import bot
+from storage_support import events, open_alerts
 
 
 class AlertsTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.messages = []
+        self.delivered = []
         self.path = Path(self.tmp.name) / "alerts.json"
-        self.alerts = bot.Alerts(self.path, self.messages.append, repeat=1800)
+        self.alerts = self.open_alerts()
+
+    def open_alerts(self):
+        return open_alerts(self, self.path, self.delivered.append)
+
+    @property
+    def messages(self):
+        self.alerts.save()
+        return [event.message for event in events(self.alerts)]
 
     def metric(self, value, name="CPU", limit=95, low=False, now=1000):
         self.alerts.metric("host1", "Laptop", bot.Metric(name, name, value, limit, low), now)
@@ -38,7 +47,7 @@ class AlertsTest(unittest.TestCase):
         self.metric(96)
         self.metric(99, now=1030)
         self.assertEqual(len(self.messages), 1)
-        self.alerts = bot.Alerts(self.path, self.messages.append)
+        self.alerts = self.open_alerts()
         self.metric(99, now=1060)
         self.assertEqual(len(self.messages), 1)
         self.metric(94, now=2800)  # Hysteresis band: neither repeat nor recovery.
@@ -59,12 +68,18 @@ class AlertsTest(unittest.TestCase):
 
     def test_failed_delivery_is_retried_not_marked_sent(self):
         self.alerts.send = lambda _: (_ for _ in ()).throw(bot.APIError("Telegram", 503))
+        self.metric(99)
+        self.assertTrue(self.alerts.state["host1:CPU"]["active"])
         with self.assertRaises(bot.APIError):
-            self.metric(99)
-        self.assertFalse(self.alerts.state.get("host1:CPU", {}).get("active"))
-        self.alerts.send = self.messages.append
+            self.alerts.flush(1300)
+        self.assertIsNone(events(self.alerts)[0].delivered)
+        self.alerts.send = self.delivered.append
         self.metric(99, now=1030)
         self.assertEqual(len(self.messages), 1)
+        self.assertFalse(self.alerts.flush(1599))
+        self.assertTrue(self.alerts.flush(1600))
+        self.assertEqual(len(self.delivered), 1)
+        self.assertIsNotNone(events(self.alerts)[0].delivered)
 
     def test_missing_data_warning_grace_recovery_and_recurrence(self):
         for now in (1000, 1030, 1119):
@@ -110,13 +125,13 @@ class AlertsTest(unittest.TestCase):
             source.latest.return_value = {"created": now * 1000, "stats": {"cpu": 10, "mp": 20}}
             bot.poll(source, self.alerts, now)
             self.alerts.save()
-            self.alerts = bot.Alerts(self.path, self.messages.append)
+            self.alerts = self.open_alerts()
         self.assertEqual(self.messages, [])
 
     def test_legacy_missing_warning_stays_silent_and_thresholds_still_work(self):
         self.alerts.state["issue:host1:missing"] = {"active": True, "sent": 1000}
         self.alerts.save()
-        self.alerts = bot.Alerts(self.path, self.messages.append)
+        self.alerts = self.open_alerts()
         source = Mock()
         source.systems.return_value = [{"id": "host1", "name": "Laptop", "status": "up"}]
         source.latest.return_value = {"created": 2800 * 1000, "stats": {"cpu": 99, "mp": 20}}

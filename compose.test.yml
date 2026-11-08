@@ -1,0 +1,38 @@
+# Isolated test database; scripts/check.sh removes this project's volume on exit.
+services:
+  postgres:
+    image: postgres:18.6-bookworm
+    environment:
+      POSTGRES_DB: monitoring_test
+      POSTGRES_USER: monitoring_test
+      POSTGRES_PASSWORD: test-only
+    volumes:
+      - postgres-test-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U monitoring_test -d monitoring_test"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+  tests:
+    build:
+      context: ./telegram-bot
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        env -u TEST_DATABASE_URL python -m unittest discover -s /tests -p 'test_*.py'
+        python -m unittest discover -s /tests -p 'test_*.py'
+    environment:
+      TEST_DATABASE_URL: postgresql+psycopg://monitoring_test:test-only@postgres/monitoring_test
+    volumes:
+      - ./tests:/tests:ro
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777
+    depends_on:
+      postgres:
+        condition: service_healthy
+networks:
+  default:
+    internal: true
+volumes:
+  postgres-test-data:
