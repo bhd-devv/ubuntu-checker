@@ -345,6 +345,51 @@ class MonitorTest(StateTestCase):
         self.assertIn("HTTP 409", self.messages[0])
         self.assertIn("Роботу відновлено", self.messages[-1])
 
+    def test_get_updates_timeouts_do_not_create_incidents_or_recovery_after_restart(self):
+        monitor = self.monitor()
+        timeout = bot.APIError("Telegram", operation="POST getUpdates", reason="TimeoutError")
+        self.commands.poll.side_effect = timeout
+        with patch.object(bot, "poll"), self.assertLogs(bot.LOG, level="WARNING") as logs:
+            monitor.tick(1000)
+            monitor.tick(1002)
+            monitor.tick(1030)
+        self.assertEqual(self.commands.poll.call_count, 2)
+        self.assertIn("Command polling timed out", " ".join(logs.output))
+        self.assertEqual(self.alerts.store.load(), {})
+        self.assertEqual(events(self.alerts), [])
+        self.assertEqual(self.alerts.pending_events, [])
+        self.alerts = self.open_alerts()
+        monitor = self.monitor()
+        with patch.object(bot, "poll"):
+            monitor.tick(1300)
+        self.assertEqual(self.alerts.store.load(), {})
+        self.assertEqual(events(self.alerts), [])
+        self.assertEqual(self.delivered, [])
+
+    def test_timeout_filter_preserves_other_failures_and_durable_delivery(self):
+        failures = [
+            ("commands", bot.APIError("Telegram", 409, operation="POST getUpdates", reason="TimeoutError")),
+            ("commands", bot.APIError("Telegram", operation="POST getUpdates", reason="ConnectionRefusedError")),
+            ("commands", bot.APIError("Telegram", operation="POST getMe", reason="TimeoutError")),
+            ("commands", bot.APIError("Telegram", operation="POST sendMessage", reason="TimeoutError")),
+            ("beszel", bot.APIError("Beszel", operation="POST getUpdates", reason="TimeoutError")),
+        ]
+        monitor = self.monitor()
+        for key, exc in failures:
+            with self.subTest(key=key, error=str(exc)), self.assertLogs(bot.LOG, level="ERROR"):
+                monitor.attempt(key, "Real failure", Mock(side_effect=exc), 1000)
+        self.alerts.save()
+        self.assertEqual(len(events(self.alerts)), len(failures))
+        self.alerts.send = Mock(side_effect=bot.APIError("Telegram", operation="POST sendMessage",
+                                                       reason="TimeoutError"))
+        with self.assertRaises(bot.APIError):
+            self.alerts.flush(1300)
+        self.assertTrue(all(event.delivered is None for event in events(self.alerts)))
+        self.alerts = self.open_alerts()
+        self.assertTrue(self.alerts.flush(1600))
+        self.assertTrue(all(event.delivered == 1600 for event in events(self.alerts)))
+        self.assertIn("Real failure", self.delivered[-1])
+
     def test_unexpected_error_is_logged_and_does_not_stop_other_checks(self):
         monitor = self.monitor()
         with patch.object(bot, "poll", side_effect=RuntimeError("SECRET")), self.assertLogs(bot.LOG) as logs:

@@ -526,6 +526,13 @@ class Diagnostics:
 
     def fail(self, key, message, exc, now):
         detail = error_detail(exc)
+        # A failed read is retried by the command polling schedule. It is not
+        # evidence that monitoring or notification delivery has failed.
+        if (key == "commands" and isinstance(exc, APIError) and exc.service == "Telegram"
+                and exc.status == 0 and exc.operation in ("getUpdates", "POST getUpdates")
+                and exc.reason == "TimeoutError"):
+            LOG.warning("Command polling timed out; retrying on next poll error=%s", detail)
+            return
         LOG.error("Operation failed key=%s error=%s", key, detail)
         key = "diagnostic:" + key
         old = self.alerts.state.get(key, {})
